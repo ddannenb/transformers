@@ -19,8 +19,11 @@
 
 
 import logging
+import os
 import random
 import timeit
+from functools import wraps
+from multiprocessing import Process, Queue
 
 from transformers import (
     TF_MODEL_MAPPING,
@@ -36,227 +39,190 @@ from .benchmark_utils import Benchmark, Memory, measure_peak_memory_cpu, start_m
 if is_tf_available():
     import tensorflow as tf
     from .benchmark_args_tf import TensorflowBenchmarkArguments
+    from tensorflow.python.framework.errors_impl import ResourceExhaustedError
 
+if is_py3nvml_available():
+    import py3nvml.py3nvml as nvml
 
 logger = logging.getLogger(__name__)
 
 
+# Hack for now to prevent wrong GPU measurements
+# Currently there does not seem to be a way to clear the
+# GPU cache within the same process, so call function on separate process
+# https://github.com/tensorflow/tensorflow/issues/36627
+# https://github.com/tensorflow/tensorflow/issues/19731
+# https://github.com/tensorflow/tensorflow/issues/37289
+# tf_context.context()._clear_caches()  # See https://github.com/tensorflow/tensorflow/issues/20218#issuecomment-416771802
+def run_on_separate_process(func):
+    # run function in an individual
+    # process to get correct memory
+    @wraps(func)
+    def process(*args, **kwargs):
+        def wrapper_func(queue, *args):
+            try:
+                logger.info("run with process id: {}".format(os.getpid()))
+                result = func(*args)
+            except Exception:
+                result = "N/A"
+                logger.warning("Exception when running on process id {os.getpid()}.")
+            queue.put(result)
+
+        queue = Queue()
+        p = Process(target=wrapper_func, args=[queue] + list(args))
+        p.start()
+        result = queue.get()
+        p.join()
+        return result
+
+    return process
+
+
+def run_with_tf_optimizations(do_eager_mode, do_xla):
+    def run_func(func):
+        @wraps(func)
+        def run_in_eager_mode(*args, **kwargs):
+            return func(*args, **kwargs)
+
+        @wraps(func)
+        @tf.function(experimental_compile=do_xla)
+        def run_in_graph_mode(*args, **kwargs):
+            return func(*args, **kwargs)
+
+        if do_eager_mode is True:
+            assert (
+                do_xla is False
+            ), "Cannot run model in XLA, if `args.eager_mode` is set to `True`. Please set `args.eager_mode=False`."
+            return run_in_eager_mode
+        else:
+            return run_in_graph_mode
+
+    return run_func
+
+
 def random_input_ids(batch_size, sequence_length, vocab_size):
     rng = random.Random()
-
     values = [rng.randint(0, vocab_size - 1) for i in range(batch_size * sequence_length)]
-
     return tf.constant(values, shape=(batch_size, sequence_length), dtype=tf.int32)
 
 
 class TensorflowBenchmark(Benchmark):
-
     args: TensorflowBenchmarkArguments
     configs: PretrainedConfig
     framework: str = "Tensorflow"
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        # hack for now to prevent wrong GPU measurements
-        if not self.args.no_memory:
-            if not sorted(self.args.batch_sizes) == self.args.batch_sizes:
-                raise ValueError(
-                    f"The measured memory usage will not be correct if `args.batch_sizes` are not sorted in"
-                    f" ascending order. Please run the benchmark with `args.batch_sizes={sorted(self.args.batch_sizes)}`."
-                )
-
-            if not sorted(self.args.sequence_lengths) == self.args.sequence_lengths:
-                raise ValueError(
-                    "The measured memory usage will not be correct if `args.sequence_lengths` are not sorted in"
-                    f" ascending order. Please run the benchmark with `args.sequence_lengths={sorted(self.args.sequence_lengths)}`."
-                )
 
     @property
     def framework_version(self):
         return tf.__version__
 
-    def train(self, model_name, batch_size, sequence_length, trace_memory=False):
-        # clear gpu cache before going into scope
-        raise NotImplementedError("Training is currently not really implemented."
-                                  "Wait for TFTrainer to support CLM and MLM.")
-        if self.args.is_gpu:
-            tf.keras.backend.clear_session()
+    def inference_speed(self, model_name, batch_size, sequence_length):
+        _inference = self._prepare_inference_func(model_name, batch_size, sequence_length)
+        return self._measure_speed(_inference)
 
-        # TODO (PVP): There does not seem to be a way to clear the
-        # GPU cache within the same process:
-        # https://github.com/tensorflow/tensorflow/issues/36627
-        # https://github.com/tensorflow/tensorflow/issues/19731
-        # https://github.com/tensorflow/tensorflow/issues/37289
-        # tf_context.context()._clear_caches()  # See https://github.com/tensorflow/tensorflow/issues/20218#issuecomment-416771802
+    def train_speed(self, model_name, batch_size, sequence_length):
+        raise NotImplementedError(
+            "Training is currently not really implemented." "Wait for TFTrainer to support CLM and MLM."
+        )
 
+    @run_on_separate_process
+    def inference_memory(self, model_name, batch_size, sequence_length):
+        strategy = self.args.strategy
+        assert strategy is not None, "A strategy has to be initialized before measuring memory usage"
+        _inference = self._prepare_inference_func(model_name, batch_size, sequence_length)
+        result = self._measure_memory(_inference)
+        return result
+
+    def train_memory(self, model_name, batch_size, sequence_length):
+        raise NotImplementedError(
+            "Training is currently not really implemented. Wait for TFTrainer to support CLM and MLM."
+        )
+
+    def _prepare_inference_func(self, model_name, batch_size, sequence_length):
+        config = self.config_dict[model_name]
+
+        if self.args.with_lm_head:
+            model = TF_MODEL_WITH_LM_HEAD_MAPPING[config.__class__](config)
+        else:
+            model = TF_MODEL_MAPPING[config.__class__](config)
+
+        # encoder-decoder has vocab size saved differently
+        vocab_size = config.vocab_size if hasattr(config, "vocab_size") else config.encoder.vocab_size
+        input_ids = random_input_ids(batch_size, sequence_length, vocab_size)
+
+        @run_with_tf_optimizations(self.args.eager_mode, self.args.use_xla)
+        def encoder_decoder_forward():
+            model(input_ids, decoder_input_ids=input_ids, training=False)
+
+        @run_with_tf_optimizations(self.args.eager_mode, self.args.use_xla)
+        def encoder_forward():
+            model(input_ids, training=False)
+
+        _inference = encoder_decoder_forward if config.is_encoder_decoder else encoder_forward
+
+        return _inference
+
+    def _measure_speed(self, func):
         with self.args.strategy.scope():
             try:
-                config = self.config_dict[model_name]
+                if self.args.is_tpu or self.args.use_xla:
+                    # run additional 10 times to stabilize compilation for tpu
+                    logger.info("Do inference on TPU. Running model 5 times to stabilize compilation")
+                    timeit.repeat(func, repeat=1, number=5)
 
-                model = TF_MODEL_WITH_LM_HEAD_MAPPING[config.__class__](config)
+                # as written in https://docs.python.org/2/library/timeit.html#timeit.Timer.repeat, min should be taken rather than the average
+                runtimes = timeit.repeat(func, repeat=self.args.repeat, number=10,)
 
-                # encoder-decoder has vocab size saved differently
-                vocab_size = config.vocab_size if hasattr(config, "vocab_size") else config.encoder.vocab_size
-
-                input_ids = random_input_ids(batch_size, sequence_length, vocab_size)
-
-                def compute_loss_and_backprob_encoder():
-                    loss = model(input_ids, labels=input_ids, training=False)[0]
-                    gradients = tf.gradients(loss, model.trainable_variables)
-                    gradients = None
-                    return gradients
-
-                def compute_loss_and_backprob_encoder_decoder():
-                    loss = model(input_ids, decoder_input_ids=input_ids, labels=input_ids)[0]
-                    gradients = tf.gradients(loss, model.trainable_variables)
-                    gradients = None
-                    return gradients
-
-                _train = (
-                    compute_loss_and_backprob_encoder_decoder
-                    if config.is_encoder_decoder
-                    else compute_loss_and_backprob_encoder
-                )
-
-                if trace_memory is True:
-                    if self.args.trace_memory_line_by_line:
-                        trace = start_memory_tracing("transformers")
-
-                    if not self.args.no_tpu and self.args.is_tpu:
-                        # tpu
-                        raise NotImplementedError(
-                            "Memory Benchmarking is currently not implemented for TPU. Please disable memory benchmarking with `args.no_memory=True`"
-                        )
-                    else:
-                        # cpu
-                        memory_bytes = measure_peak_memory_cpu(_train, "cpu")
-                        memory = Memory(memory_bytes) if isinstance(memory_bytes, int) else memory_bytes
-
-                    if self.args.trace_memory_line_by_line:
-                        summary = stop_memory_tracing(trace)
-                    else:
-                        summary = None
-
-                    if self.args.n_gpu > 0:
-                        # gpu
-                        if not is_py3nvml_available():
-                            logger.warning(
-                                "py3nvml not installed, we won't log GPU memory usage. "
-                                "Install py3nvml (pip install py3nvml) to log information about GPU."
-                            )
-                            memory = "N/A"
-                        else:
-                            max_bytes_in_use = measure_peak_memory_cpu(_train, "gpu", device_idx=self.args.device_idx)
-
-                            memory = Memory(max_bytes_in_use)
-
-                    return memory, summary
-                else:
-                    if not self.args.no_tpu and self.args.is_tpu:
-                        # run additional 10 times to stabilize compilation for tpu
-                        logger.info("Do inference on TPU. Running model 5 times to stabilize compilation")
-                        timeit.repeat(
-                            _train, repeat=1, number=5,
-                        )
-
-                    # as written in https://docs.python.org/2/library/timeit.html#timeit.Timer.repeat, min should be taken rather than the average
-                    runtimes = timeit.repeat(_train, repeat=self.args.repeat, number=10,)
-
-                    return min(runtimes) / 10.0
-            except RuntimeError as e:
+                return min(runtimes) / 10.0
+            except ResourceExhaustedError as e:
                 self.print_fn("Doesn't fit on GPU. {}".format(e))
-                if trace_memory:
-                    return "N/A", None
-                else:
-                    return "N/A"
 
-    def inference(self, model_name, batch_size, sequence_length, trace_memory=False):
-        # clear gpu cache before going into scope
-        if self.args.is_gpu:
-            tf.keras.backend.clear_session()
-        # TODO (PVP): There does not seem to be a way to clear the
-        # GPU cache within the same process:
-        # https://github.com/tensorflow/tensorflow/issues/36627
-        # https://github.com/tensorflow/tensorflow/issues/19731
-        # https://github.com/tensorflow/tensorflow/issues/37289
-        # tf_context.context()._clear_caches()  # See https://github.com/tensorflow/tensorflow/issues/20218#issuecomment-416771802
-
+    def _measure_memory(self, func):
+        logger.info(
+            "Note that Tensorflow allocates more memory than"
+            "it might need to speed up computation."
+            "The memory reported here corresponds to the memory"
+            "reported by `nvidia-smi`, which can vary depending"
+            "on total available memory on the GPU that is used."
+        )
         with self.args.strategy.scope():
             try:
-                config = self.config_dict[model_name]
-                model = None
+                if self.args.trace_memory_line_by_line:
+                    trace = start_memory_tracing("transformers")
 
-                if self.args.with_lm_head:
-                    model = TF_MODEL_WITH_LM_HEAD_MAPPING[config.__class__](config)
-                else:
-                    model = TF_MODEL_MAPPING[config.__class__](config)
-
-                # encoder-decoder has vocab size saved differently
-                vocab_size = config.vocab_size if hasattr(config, "vocab_size") else config.encoder.vocab_size
-
-                input_ids = random_input_ids(batch_size, sequence_length, vocab_size)
-
-                def encoder_decoder_forward():
-                    model(input_ids, decoder_input_ids=input_ids, training=False)
-
-                def encoder_forward():
-                    model(input_ids, training=False)
-
-                _forward = encoder_decoder_forward if config.is_encoder_decoder else encoder_forward
-
-                if trace_memory is True:
-                    if self.args.trace_memory_line_by_line:
-                        trace = start_memory_tracing("transformers")
-
-                    if not self.args.no_tpu and self.args.is_tpu:
-                        # tpu
-                        raise NotImplementedError(
-                            "Memory Benchmarking is currently not implemented for TPU. Please disable memory benchmarking with `args.no_memory=True`"
+                if not self.args.no_tpu and self.args.is_tpu:
+                    # tpu
+                    raise NotImplementedError(
+                        "Memory Benchmarking is currently not implemented for TPU. Please disable memory benchmarking with `args.no_memory=True`"
+                    )
+                if not self.args.is_gpu:
+                    # cpu
+                    memory_bytes = measure_peak_memory_cpu(func)
+                    memory = Memory(memory_bytes) if isinstance(memory_bytes, int) else memory_bytes
+                if self.args.is_gpu:
+                    # gpu
+                    if not is_py3nvml_available():
+                        logger.warning(
+                            "py3nvml not installed, we won't log GPU memory usage. "
+                            "Install py3nvml (pip install py3nvml) to log information about GPU."
                         )
+                        memory = "N/A"
                     else:
-                        # cpu
-                        memory_bytes = measure_peak_memory_cpu(_forward, "cpu")
-                        memory = Memory(memory_bytes) if isinstance(memory_bytes, int) else memory_bytes
+                        # init nvml
+                        nvml.nvmlInit()
+                        func()
+                        handle = nvml.nvmlDeviceGetHandleByIndex(self.args.device_idx)
+                        meminfo = nvml.nvmlDeviceGetMemoryInfo(handle)
+                        max_bytes_in_use = meminfo.used
+                        memory = Memory(max_bytes_in_use)
+                        # shutdown nvml
+                        nvml.nvmlShutdown()
 
-                    if self.args.trace_memory_line_by_line:
-                        summary = stop_memory_tracing(trace)
-                    else:
-                        summary = None
-
-                    if self.args.n_gpu > 0:
-                        # gpu
-                        if not is_py3nvml_available():
-                            logger.warning(
-                                "py3nvml not installed, we won't log GPU memory usage. "
-                                "Install py3nvml (pip install py3nvml) to log information about GPU."
-                            )
-                            memory = "N/A"
-                        else:
-                            max_bytes_in_use = measure_peak_memory_cpu(
-                                _forward, "gpu", device_idx=self.args.device_idx, interval=0.1
-                            )
-
-                            memory = Memory(max_bytes_in_use)
-
-                    return memory, summary
+                if self.args.trace_memory_line_by_line:
+                    summary = stop_memory_tracing(trace)
                 else:
+                    summary = None
 
-                    if not self.args.no_tpu and not self.args.is_tpu:
-                        # run additional 10 times to stabilize compilation for tpu
-                        logger.info("Do inference on TPU. Running model 5 times to stabilize compilation")
-                        timeit.repeat(
-                            _forward, repeat=1, number=5,
-                        )
-
-                    # as written in https://docs.python.org/2/library/timeit.html#timeit.Timer.repeat, min should be taken rather than the average
-                    runtimes = timeit.repeat(_forward, repeat=self.args.repeat, number=10,)
-
-                    return min(runtimes) / 10.0
-
-            except RuntimeError as e:
+                return memory, summary
+            except ResourceExhaustedError as e:
                 self.print_fn("Doesn't fit on GPU. {}".format(e))
-                if trace_memory:
-                    return "N/A", None
-                else:
-                    return "N/A"
+                return "N/A", None

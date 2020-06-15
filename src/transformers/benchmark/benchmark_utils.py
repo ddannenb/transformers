@@ -136,9 +136,7 @@ class MemorySummary(NamedTuple):
 MemoryTrace = List[UsedMemoryState]
 
 
-def measure_peak_memory_cpu(
-    function: Callable[[], None], processessing_unit_type: str, interval=0.5, device_idx=None
-) -> int:
+def measure_peak_memory_cpu(function: Callable[[], None], interval=0.5, device_idx=None) -> int:
 
     """
         measures peak cpu memory consumption of a given `function`
@@ -151,9 +149,6 @@ def measure_peak_memory_cpu(
             - `function`: (`callable`): function() -> ...
                 function without any arguments to measure for which to measure the peak memory
 
-            - `processessing_unit_type: (`str`):
-                type of Processing Unit to measure. Either "cpu" or "gpu"
-
             - `interval`: (`float`, `optional`, defaults to `0.5`)
                 interval in second for which to measure the memory usage
 
@@ -164,37 +159,6 @@ def measure_peak_memory_cpu(
             - `max_memory`: (`int`)
                 cosumed memory peak in Bytes
     """
-
-    def get_gpu_memory(process_id: int, device_idx: int) -> int:
-        """
-            measures current gpu memory usage of a given `process_id`
-
-            Args:
-                - `process_id`: (`int`)
-                    process_id for which to measure memory
-
-                - `device_idx`: (`int`)
-                    device id for which to measure gpu usage
-
-            Returns
-                - `memory`: (`int`)
-                    cosumed memory in Bytes
-        """
-        try:
-            nvml.nvmlInit()
-            handle = nvml.nvmlDeviceGetHandleByIndex(device_idx)
-            processes = nvml.nvmlDeviceGetComputeRunningProcesses(handle)
-            current_process = next(filter(lambda x: x.pid == process_id, processes))
-            memory = current_process.usedGpuMemory
-            nvml.nvmlShutdown()
-        except nvml.NVMLError_GpuIsLost:
-            raise ValueError("Error with p3nvml.")
-        except (RuntimeError):
-            import ipdb
-
-            ipdb.set_trace()
-            raise RuntimeError
-        return memory
 
     def get_cpu_memory(process_id: int) -> int:
         """
@@ -237,25 +201,13 @@ def measure_peak_memory_cpu(
                 self.interval = interval
                 self.connection = child_connection
                 self.num_measurements = 1
-                if processessing_unit_type == "cpu":
-                    self.mem_usage = get_cpu_memory(self.process_id)
-                elif processessing_unit_type == "gpu":
-                    self.mem_usage = get_gpu_memory(self.process_id, device_idx)
-                else:
-                    raise NotImplementedError(f"{processessing_unit_type} does not exist.")
+                self.mem_usage = get_cpu_memory(self.process_id)
 
             def run(self):
                 self.connection.send(0)
                 stop = False
                 while True:
-                    if processessing_unit_type == "cpu":
-                        mem_usage = get_cpu_memory(self.process_id)
-                    elif processessing_unit_type == "gpu":
-                        mem_usage = get_gpu_memory(self.process_id, device_idx)
-                    else:
-                        raise NotImplementedError(f"{processessing_unit_type} does not exist.")
-
-                    self.mem_usage = max(self.mem_usage, mem_usage)
+                    self.mem_usage = max(self.mem_usage, get_cpu_memory(self.process_id))
                     self.num_measurements += 1
 
                     if stop:
@@ -598,11 +550,19 @@ class Benchmark(ABC):
         pass
 
     @abstractmethod
-    def train(self, model_name, batch_size, sequence_length):
+    def inference_speed(self, model_name, batch_size, sequence_length):
         pass
 
     @abstractmethod
-    def inference(self, model_name, batch_size, sequence_length):
+    def train_speed(self, model_name, batch_size, sequence_length):
+        pass
+
+    @abstractmethod
+    def inference_memory(self, model_name, batch_size, sequence_length):
+        pass
+
+    @abstractmethod
+    def train_memory(self, model_name, batch_size, sequence_length):
         pass
 
     def run(self):
@@ -631,22 +591,18 @@ class Benchmark(ABC):
                 for sequence_length in self.args.sequence_lengths:
                     if not self.args.no_inference:
                         if not self.args.no_memory:
-                            memory, inference_summary = self.inference(
-                                model_name, batch_size, sequence_length, trace_memory=True
-                            )
+                            memory, inference_summary = self.inference_memory(model_name, batch_size, sequence_length)
                             inference_result_memory[model_name]["result"][batch_size][sequence_length] = memory
                         if not self.args.no_speed:
-                            time = self.inference(model_name, batch_size, sequence_length, trace_memory=False)
+                            time = self.inference_speed(model_name, batch_size, sequence_length)
                             inference_result_time[model_name]["result"][batch_size][sequence_length] = time
 
                     if self.args.training:
                         if not self.args.no_memory:
-                            memory, train_summary = self.train(
-                                model_name, batch_size, sequence_length, trace_memory=True
-                            )
+                            memory, train_summary = self.train_memory(model_name, batch_size, sequence_length)
                             train_result_memory[model_name]["result"][batch_size][sequence_length] = memory
                         if not self.args.no_speed:
-                            time = self.inference(model_name, batch_size, sequence_length, trace_memory=False)
+                            time = self.train_speed(model_name, batch_size, sequence_length)
                             train_result_time[model_name]["result"][batch_size][sequence_length] = time
 
         if not self.args.no_inference:
@@ -716,6 +672,9 @@ class Benchmark(ABC):
             info["framework"] = self.framework
             if self.framework == "PyTorch":
                 info["use_torchscript"] = self.args.torchscript
+            if self.framework == "Tensorflow":
+                info["eager_mode"] = self.args.eager_mode
+                info["usa_xla"] = self.args.use_xla
             info["framework_version"] = self.framework_version
             info["python_version"] = platform.python_version()
             info["system"] = platform.system()
